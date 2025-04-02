@@ -1,0 +1,44 @@
+<?php
+require_once("admin/pages/connect.php");
+
+?>
+<!DOCTYPE html>
+<html lang="en">	
+<?php include ('head.php');  ?>
+  <body>
+	
+	<div id="div_content">
+	
+		
+      		<?php   
+						if(!isset($_GET['page']))
+							$_GET['page']=0;
+
+
+
+							$page = $_GET['page'];					
+							
+							if(!file_exists('pages/'.$page.'.php'))
+							{
+								$page='main';
+							}
+						
+							include('pages/'.$page.'.php');
+
+							
+			?>
+	            	     	
+    	
+	</div>
+	
+
+
+    <!-- Footer -->
+
+		<?php include ('footer.php');  ?>
+   
+    
+	
+  </body>
+
+</html>
